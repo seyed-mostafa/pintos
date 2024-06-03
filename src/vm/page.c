@@ -1,409 +1,318 @@
-#include <hash.h>
-#include <string.h>
-#include "lib/kernel/hash.h"
-
-#include "threads/synch.h"
-#include "threads/malloc.h"
-#include "threads/palloc.h"
-#include "threads/vaddr.h"
-#include "userprog/pagedir.h"
 #include "vm/page.h"
+#include <stdio.h>
+#include <string.h>
 #include "vm/frame.h"
+#include "vm/swap.h"
 #include "filesys/file.h"
-
-static unsigned spte_hash_func(const struct hash_elem *elem, void *aux);
-static bool     spte_less_func(const struct hash_elem *, const struct hash_elem *, void *aux);
-static void     spte_destroy_func(struct hash_elem *elem, void *aux);
-
-
-struct supplemental_page_table*
-vm_supt_create (void)
-{
-  struct supplemental_page_table *supt =
-    (struct supplemental_page_table*) malloc(sizeof(struct supplemental_page_table));
-
-  hash_init (&supt->page_map, spte_hash_func, spte_less_func, NULL);
-  return supt;
-}
-
-void
-vm_supt_destroy (struct supplemental_page_table *supt)
-{
-  ASSERT (supt != NULL);
-
-  hash_destroy (&supt->page_map, spte_destroy_func);
-  free (supt);
-}
-
-
-/**
- * Install a page (specified by the starting address `upage`) which
- * is currently on the frame, in the supplemental page table.
- *
- * Returns true if successful, false otherwise.
- * (In case of failure, a proper handling is required later -- process.c)
- */
-bool
-vm_supt_install_frame (struct supplemental_page_table *supt, void *upage, void *kpage)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = (struct supplemental_page_table_entry *) malloc(sizeof(struct supplemental_page_table_entry));
-
-  spte->upage = upage;
-  spte->kpage = kpage;
-  spte->status = ON_FRAME;
-  spte->dirty = false;
-  spte->swap_index = -1;
-
-  struct hash_elem *prev_elem;
-  prev_elem = hash_insert (&supt->page_map, &spte->elem);
-  if (prev_elem == NULL) {
-    // successfully inserted into the supplemental page table.
-    return true;
-  }
-  else {
-    // failed. there is already an entry.
-    free (spte);
-    return false;
-  }
-}
-
-/**
- * Install new a page (specified by the starting address `upage`)
- * on the supplemental page table. The page is of type ALL_ZERO,
- * indicates that all the bytes is (lazily) zero.
- */
-bool
-vm_supt_install_zeropage (struct supplemental_page_table *supt, void *upage)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = (struct supplemental_page_table_entry *) malloc(sizeof(struct supplemental_page_table_entry));
-
-  spte->upage = upage;
-  spte->kpage = NULL;
-  spte->status = ALL_ZERO;
-  spte->dirty = false;
-
-  struct hash_elem *prev_elem;
-  prev_elem = hash_insert (&supt->page_map, &spte->elem);
-  if (prev_elem == NULL) return true;
-
-  // there is already an entry -- impossible state
-  PANIC("Duplicated SUPT entry for zeropage");
-  return false;
-}
-
-/**
- * Mark an existent page to be swapped out,
- * and update swap_index in the SPTE.
- */
-bool
-vm_supt_set_swap (struct supplemental_page_table *supt, void *page, swap_index_t swap_index)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = vm_supt_lookup(supt, page);
-  if(spte == NULL) return false;
-
-  spte->status = ON_SWAP;
-  spte->kpage = NULL;
-  spte->swap_index = swap_index;
-  return true;
-}
-
-
-/**
- * Install a new page (specified by the starting address `upage`)
- * on the supplemental page table, of type FROM_FILESYS.
- */
-bool
-vm_supt_install_filesys (struct supplemental_page_table *supt, void *upage,
-    struct file * file, off_t offset, uint32_t read_bytes, uint32_t zero_bytes, bool writable)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = (struct supplemental_page_table_entry *) malloc(sizeof(struct supplemental_page_table_entry));
-
-  spte->upage = upage;
-  spte->kpage = NULL;
-  spte->status = FROM_FILESYS;
-  spte->dirty = false;
-  spte->file = file;
-  spte->file_offset = offset;
-  spte->read_bytes = read_bytes;
-  spte->zero_bytes = zero_bytes;
-  spte->writable = writable;
-
-  struct hash_elem *prev_elem;
-  prev_elem = hash_insert (&supt->page_map, &spte->elem);
-  if (prev_elem == NULL) return true;
-
-  // there is already an entry -- impossible state
-  PANIC("Duplicated SUPT entry for filesys-page");
-  return false;
-}
-
-
-/**
- * Lookup the SUPT and find a SPTE object given the user page address.
- * returns NULL if no such entry is found.
- */
-struct supplemental_page_table_entry*
-vm_supt_lookup (struct supplemental_page_table *supt, void *page)
-{
-  // create a temporary object, just for looking up the hash table.
-  struct supplemental_page_table_entry spte_temp;
-  spte_temp.upage = page;
-
-  struct hash_elem *elem = hash_find (&supt->page_map, &spte_temp.elem);
-  if(elem == NULL) return NULL;
-  return hash_entry(elem, struct supplemental_page_table_entry, elem);
-}
-
-/**
- * Returns if the SUPT contains an SPTE entry given the user page address.
- */
-bool
-vm_supt_has_entry (struct supplemental_page_table *supt, void *page)
-{
-  /* Find the SUPT entry. If not found, it is an unmanaged page. */
-  struct supplemental_page_table_entry *spte = vm_supt_lookup(supt, page);
-  if(spte == NULL) return false;
-
-  return true;
-}
-
-bool
-vm_supt_set_dirty (struct supplemental_page_table *supt, void *page, bool value)
-{
-  struct supplemental_page_table_entry *spte = vm_supt_lookup(supt, page);
-  if (spte == NULL) PANIC("set dirty - the request page doesn't exist");
-
-  spte->dirty = spte->dirty || value;
-  return true;
-}
-
-static bool vm_load_page_from_filesys(struct supplemental_page_table_entry *, void *);
-
-/**
- * Load the page, specified by the address `upage`, back into the memory.
- */
-bool
-vm_load_page(struct supplemental_page_table *supt, uint32_t *pagedir, void *upage)
-{
-  /* see also userprog/exception.c */
-
-  // 1. Check if the memory reference is valid
-  struct supplemental_page_table_entry *spte;
-  spte = vm_supt_lookup(supt, upage);
-  if(spte == NULL) {
-    return false;
-  }
-
-  if(spte->status == ON_FRAME) {
-    // already loaded
-    return true;
-  }
-
-  // 2. Obtain a frame to store the page
-  void *frame_page = vm_frame_allocate(PAL_USER, upage);
-  if(frame_page == NULL) {
-    return false;
-  }
-
-  // 3. Fetch the data into the frame
-  bool writable = true;
-  switch (spte->status)
-  {
-  case ALL_ZERO:
-    memset (frame_page, 0, PGSIZE);
-    break;
-
-  case ON_FRAME:
-    /* nothing to do */
-    break;
-
-  case ON_SWAP:
-    // Swap in: load the data from the swap disc
-    vm_swap_in (spte->swap_index, frame_page);
-    break;
-
-  case FROM_FILESYS:
-    if( vm_load_page_from_filesys(spte, frame_page) == false) {
-      vm_frame_free(frame_page);
-      return false;
-    }
-
-    writable = spte->writable;
-    break;
-
-  default:
-    PANIC ("unreachable state");
-  }
-
-  // 4. Point the page table entry for the faulting virtual address to the physical page.
-  if(!pagedir_set_page (pagedir, upage, frame_page, writable)) {
-    vm_frame_free(frame_page);
-    return false;
-  }
-
-  // Make SURE to mapped kpage is stored in the SPTE.
-  spte->kpage = frame_page;
-  spte->status = ON_FRAME;
-
-  pagedir_set_dirty (pagedir, frame_page, false);
-
-  // unpin frame
-  vm_frame_unpin(frame_page);
-
-  return true;
-}
-
-bool
-vm_supt_mm_unmap(
-    struct supplemental_page_table *supt, uint32_t *pagedir,
-    void *page, struct file *f, off_t offset, size_t bytes)
-{
-  struct supplemental_page_table_entry *spte = vm_supt_lookup(supt, page);
-  if(spte == NULL) {
-    PANIC ("munmap - some page is missing; can't happen!");
-  }
-
-  // Pin the associated frame if loaded
-  // otherwise, a page fault could occur while swapping in (reading the swap disk)
-  if (spte->status == ON_FRAME) {
-    ASSERT (spte->kpage != NULL);
-    vm_frame_pin (spte->kpage);
-  }
-
-
-  // see also, vm_load_page()
-  switch (spte->status)
-  {
-  case ON_FRAME:
-    ASSERT (spte->kpage != NULL);
-
-    // Dirty frame handling (write into file)
-    // Check if the upage or mapped frame is dirty. If so, write to file.
-    bool is_dirty = spte->dirty;
-    is_dirty = is_dirty || pagedir_is_dirty(pagedir, spte->upage);
-    is_dirty = is_dirty || pagedir_is_dirty(pagedir, spte->kpage);
-    if(is_dirty) {
-      file_write_at (f, spte->upage, bytes, offset);
-    }
-
-    // clear the page mapping, and release the frame
-    vm_frame_free (spte->kpage);
-    pagedir_clear_page (pagedir, spte->upage);
-    break;
-
-  case ON_SWAP:
-    {
-      bool is_dirty = spte->dirty;
-      is_dirty = is_dirty || pagedir_is_dirty(pagedir, spte->upage);
-      if (is_dirty) {
-        // load from swap, and write back to file
-        void *tmp_page = palloc_get_page(0); // in the kernel
-        vm_swap_in (spte->swap_index, tmp_page);
-        file_write_at (f, tmp_page, PGSIZE, offset);
-        palloc_free_page(tmp_page);
-      }
-      else {
-        // just throw away the swap.
-        vm_swap_free (spte->swap_index);
-      }
-    }
-    break;
-
-  case FROM_FILESYS:
-    // do nothing.
-    break;
-
-  default:
-    // Impossible, such as ALL_ZERO
-    PANIC ("unreachable state");
-  }
-
-  // the supplemental page table entry is also removed.
-  // so that the unmapped memory is unreachable. Later access will fault.
-  hash_delete(& supt->page_map, &spte->elem);
-  return true;
-}
-
-
-static bool vm_load_page_from_filesys(struct supplemental_page_table_entry *spte, void *kpage)
-{
-  file_seek (spte->file, spte->file_offset);
-
-  // read bytes from the file
-  int n_read = file_read (spte->file, kpage, spte->read_bytes);
-  if(n_read != (int)spte->read_bytes)
-    return false;
-
-  // remain bytes are just zero
-  ASSERT (spte->read_bytes + spte->zero_bytes == PGSIZE);
-  memset (kpage + n_read, 0, spte->zero_bytes);
-  return true;
-}
-
-
-/** Pin the page. */
-void
-vm_pin_page(struct supplemental_page_table *supt, void *page)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = vm_supt_lookup(supt, page);
-  if(spte == NULL) {
-    // ignore. stack may be grow
-    return;
-  }
-
-  ASSERT (spte->status == ON_FRAME);
-  vm_frame_pin (spte->kpage);
-}
-
-/** Unpin the page. */
-void
-vm_unpin_page(struct supplemental_page_table *supt, void *page)
-{
-  struct supplemental_page_table_entry *spte;
-  spte = vm_supt_lookup(supt, page);
-  if(spte == NULL) PANIC ("request page is non-existent");
-
-  if (spte->status == ON_FRAME) {
-    vm_frame_unpin (spte->kpage);
-  }
-}
-
-
-/* Helpers */
-
-// Hash Functions required for [frame_map]. Uses 'kaddr' as key.
-static unsigned
-spte_hash_func(const struct hash_elem *elem, void *aux UNUSED)
-{
-  struct supplemental_page_table_entry *entry = hash_entry(elem, struct supplemental_page_table_entry, elem);
-  return hash_int( (int)entry->upage );
-}
-static bool
-spte_less_func(const struct hash_elem *a, const struct hash_elem *b, void *aux UNUSED)
-{
-  struct supplemental_page_table_entry *a_entry = hash_entry(a, struct supplemental_page_table_entry, elem);
-  struct supplemental_page_table_entry *b_entry = hash_entry(b, struct supplemental_page_table_entry, elem);
-  return a_entry->upage < b_entry->upage;
-}
+#include "threads/malloc.h"
+#include "threads/thread.h"
+#include "userprog/pagedir.h"
+#include "threads/vaddr.h"
+
+/* Maximum size of process stack, in bytes. */
+/* Right now it is 1 megabyte. */
+#define STACK_MAX (1024 * 1024)
+
+/* Destroys a page, which must be in the current process's
+   page table.  Used as a callback for hash_destroy(). */
 static void
-spte_destroy_func(struct hash_elem *elem, void *aux UNUSED)
+destroy_page (struct hash_elem *p_, void *aux UNUSED)
 {
-  struct supplemental_page_table_entry *entry = hash_entry(elem, struct supplemental_page_table_entry, elem);
+  struct page *p = hash_entry (p_, struct page, hash_elem);
+  frame_lock (p);
+  if (p->frame)
+    frame_free (p->frame);
+  free (p);
+}
 
-  // Clean up the associated frame
-  if (entry->kpage != NULL) {
-    ASSERT (entry->status == ON_FRAME);
-    vm_frame_remove_entry (entry->kpage);
+/* Destroys the current process's page table. */
+void
+page_exit (void)
+{
+  struct hash *h = thread_current ()->pages;
+  if (h != NULL)
+    hash_destroy (h, destroy_page);
+}
+
+/* Returns the page containing the given virtual ADDRESS,
+   or a null pointer if no such page exists.
+   Allocates stack pages as necessary. */
+static struct page *
+page_for_addr (const void *address)
+{
+  if (address < PHYS_BASE)
+    {
+      struct page p;
+      struct hash_elem *e;
+
+      /* Find existing page. */
+      p.addr = (void *) pg_round_down (address);
+      e = hash_find (thread_current ()->pages, &p.hash_elem);
+      if (e != NULL)
+        return hash_entry (e, struct page, hash_elem);
+
+      /* -We need to determine if the program is attempting to access the stack.
+         -First, we ensure that the address is not beyond the bounds of the stack space (1 MB in this
+          case).
+         -As long as the user is attempting to acsess an address within 32 bytes (determined by the space
+          needed for a PUSHA command) of the stack pointers, we assume that the address is valid. In that
+          case, we should allocate one more stack page accordingly.
+      */
+      if ((p.addr > PHYS_BASE - STACK_MAX) && ((void *)thread_current()->user_esp - 32 < address))
+      {
+        return page_allocate (p.addr, false);
+      }
+    }
+
+  return NULL;
+}
+
+/* Locks a frame for page P and pages it in.
+   Returns true if successful, false on failure. */
+static bool
+do_page_in (struct page *p)
+{
+  /* Get a frame for the page. */
+  p->frame = frame_alloc_and_lock (p);
+  if (p->frame == NULL)
+    return false;
+
+  /* Copy data into the frame. */
+  if (p->sector != (block_sector_t) -1)
+    {
+      /* Get data from swap. */
+      swap_in (p);
+    }
+  else if (p->file != NULL)
+    {
+      /* Get data from file. */
+      off_t read_bytes = file_read_at (p->file, p->frame->base,
+                                        p->file_bytes, p->file_offset);
+      off_t zero_bytes = PGSIZE - read_bytes;
+      memset (p->frame->base + read_bytes, 0, zero_bytes);
+      if (read_bytes != p->file_bytes)
+        printf ("bytes read (%"PROTd") != bytes requested (%"PROTd")\n",
+                read_bytes, p->file_bytes);
+    }
+  else
+    {
+      /* Provide all-zero page. */
+      memset (p->frame->base, 0, PGSIZE);
+    }
+
+  return true;
+}
+
+/* Faults in the page containing FAULT_ADDR.
+   Returns true if successful, false on failure. */
+bool
+page_in (void *fault_addr)
+{
+  struct page *p;
+  bool success;
+
+  /* Can't handle page faults without a hash table. */
+  if (thread_current ()->pages == NULL)
+    return false;
+
+  p = page_for_addr (fault_addr);
+  if (p == NULL)
+    return false;
+
+  frame_lock (p);
+  if (p->frame == NULL)
+    {
+      if (!do_page_in (p))
+        return false;
+    }
+  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+
+  /* Install frame into page table. */
+  success = pagedir_set_page (thread_current ()->pagedir, p->addr,
+                              p->frame->base, !p->read_only);
+
+  /* Release frame. */
+  frame_unlock (p->frame);
+
+  return success;
+}
+
+/* Evicts page P.
+   P must have a locked frame.
+   Return true if successful, false on failure. */
+bool
+page_out (struct page *p)
+{
+  bool dirty;
+  bool ok = false;
+
+  ASSERT (p->frame != NULL);
+  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+
+  /* Mark page not present in page table, forcing accesses by the
+     process to fault.  This must happen before checking the
+     dirty bit, to prevent a race with the process dirtying the
+     page. */
+  pagedir_clear_page(p->thread->pagedir, (void *) p->addr);
+
+  /* Has the frame been modified? */
+  /* If the frame has been modified, set 'dirty' to true. */
+  dirty = pagedir_is_dirty (p->thread->pagedir, (const void *) p->addr);
+
+  /* If the frame is not dirty (and file != NULL), we have sucsessfully evicted the page. */
+  if(!dirty)
+  {
+    ok = true;
   }
-  else if(entry->status == ON_SWAP) {
-    vm_swap_free (entry->swap_index);
+  
+  /* If the file is null, we definitely don't want to write the frame to disk. We must swap out the
+     frame and save whether or not the swap was successful. This could overwrite the previous value of
+     'ok'. */
+  if (p->file == NULL)
+  {
+    ok = swap_out(p);
+  }
+  /* Otherwise, a file exists for this page. If file contents have been modified, then they must be
+     be written back to the file system on disk, or swapped out. This is determined by the private
+     variable associated with the page. */
+  else
+  {
+    if (dirty)
+    {
+      if(p->private)
+      {
+        ok = swap_out(p);
+      }
+      else
+      {
+        ok = file_write_at(p->file, (const void *) p->frame->base, p->file_bytes, p->file_offset);
+      }
+    }
   }
 
-  // Clean up SPTE entry.
-  free (entry);
+  /* Nullify the frame held by the page. */
+  if(ok)
+  {
+    p->frame = NULL;
+  }
+  return ok;
+}
+
+/* Returns true if page P's data has been accessed recently,
+   false otherwise.
+   P must have a frame locked into memory. */
+bool
+page_accessed_recently (struct page *p)
+{
+  bool was_accessed;
+
+  ASSERT (p->frame != NULL);
+  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+
+  was_accessed = pagedir_is_accessed (p->thread->pagedir, p->addr);
+  if (was_accessed)
+    pagedir_set_accessed (p->thread->pagedir, p->addr, false);
+  return was_accessed;
+}
+
+/* Adds a mapping for user virtual address VADDR to the page hash
+   table.  Fails if VADDR is already mapped or if memory
+   allocation fails. */
+struct page *
+page_allocate (void *vaddr, bool read_only)
+{
+  struct thread *t = thread_current ();
+  struct page *p = malloc (sizeof *p);
+  if (p != NULL)
+    {
+      p->addr = pg_round_down (vaddr);
+
+      p->read_only = read_only;
+      p->private = !read_only;
+
+      p->frame = NULL;
+
+      p->sector = (block_sector_t) -1;
+
+      p->file = NULL;
+      p->file_offset = 0;
+      p->file_bytes = 0;
+
+      p->thread = thread_current ();
+
+      if (hash_insert (t->pages, &p->hash_elem) != NULL)
+        {
+          /* Already mapped. */
+          free (p);
+          p = NULL;
+        }
+    }
+  return p;
+}
+
+/* Evicts the page containing address VADDR
+   and removes it from the page table. */
+void
+page_deallocate (void *vaddr)
+{
+  struct page *p = page_for_addr (vaddr);
+  ASSERT (p != NULL);
+  frame_lock (p);
+  if (p->frame)
+    {
+      struct frame *f = p->frame;
+      if (p->file && !p->private)
+        page_out (p);
+      frame_free (f);
+    }
+  hash_delete (thread_current ()->pages, &p->hash_elem);
+  free (p);
+}
+
+/* Returns a hash value for the page that E refers to. */
+unsigned
+page_hash (const struct hash_elem *e, void *aux UNUSED)
+{
+  const struct page *p = hash_entry (e, struct page, hash_elem);
+  return ((uintptr_t) p->addr) >> PGBITS;
+}
+
+/* Returns true if page A precedes page B. */
+bool
+page_less (const struct hash_elem *a_, const struct hash_elem *b_,
+           void *aux UNUSED)
+{
+  const struct page *a = hash_entry (a_, struct page, hash_elem);
+  const struct page *b = hash_entry (b_, struct page, hash_elem);
+
+  return a->addr < b->addr;
+}
+
+/* Tries to lock the page containing ADDR into physical memory.
+   If WILL_WRITE is true, the page must be writeable;
+   otherwise it may be read-only.
+   Returns true if successful, false on failure. */
+bool
+page_lock (const void *addr, bool will_write)
+{
+  struct page *p = page_for_addr (addr);
+  if (p == NULL || (p->read_only && will_write))
+    return false;
+
+  frame_lock (p);
+  if (p->frame == NULL)
+    return (do_page_in (p)
+            && pagedir_set_page (thread_current ()->pagedir, p->addr,
+                                 p->frame->base, !p->read_only));
+  else
+    return true;
+}
+
+/* Unlocks a page locked with page_lock(). */
+void
+page_unlock (const void *addr)
+{
+  struct page *p = page_for_addr (addr);
+  ASSERT (p != NULL);
+  frame_unlock (p->frame);
 }

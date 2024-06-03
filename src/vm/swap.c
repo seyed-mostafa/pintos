@@ -1,90 +1,89 @@
-#include <bitmap.h>
-#include "threads/vaddr.h"
-#include "devices/block.h"
 #include "vm/swap.h"
+#include <bitmap.h>
+#include <debug.h>
+#include <stdio.h>
+#include "vm/frame.h"
+#include "vm/page.h"
+#include "threads/synch.h"
+#include "threads/vaddr.h"
 
-static struct block *swap_block;
-static struct bitmap *swap_available;
+/* The swap device. */
+static struct block *swap_device;
 
-static const size_t SECTORS_PER_PAGE = PGSIZE / BLOCK_SECTOR_SIZE;
+/* Used swap pages. */
+static struct bitmap *swap_bitmap;
 
-// the number of possible (swapped) pages.
-static size_t swap_size;
+/* Protects swap_bitmap. */
+static struct lock swap_lock;
 
+/* Number of sectors per page. */
+#define PAGE_SECTORS (PGSIZE / BLOCK_SECTOR_SIZE)
+
+/* Sets up swap. */
 void
-vm_swap_init ()
+swap_init (void)
 {
-  ASSERT (SECTORS_PER_PAGE > 0); // 4096/512 = 8?
-
-  // Initialize the swap disk
-  swap_block = block_get_role(BLOCK_SWAP);
-  if(swap_block == NULL) {
-    PANIC ("Error: Can't initialize swap block");
-    NOT_REACHED ();
-  }
-
-  // Initialize swap_available, with all entry true
-  // each single bit of `swap_available` corresponds to a block region,
-  // which consists of contiguous [SECTORS_PER_PAGE] sectors,
-  // their total size being equal to PGSIZE.
-  swap_size = block_size(swap_block) / SECTORS_PER_PAGE;
-  swap_available = bitmap_create(swap_size);
-  bitmap_set_all(swap_available, true);
+  swap_device = block_get_role (BLOCK_SWAP);
+  if (swap_device == NULL)
+    {
+      printf ("no swap device--swap disabled\n");
+      swap_bitmap = bitmap_create (0);
+    }
+  else
+    swap_bitmap = bitmap_create (block_size (swap_device)
+                                 / PAGE_SECTORS);
+  if (swap_bitmap == NULL)
+    PANIC ("couldn't create swap bitmap");
+  lock_init (&swap_lock);
 }
 
-
-swap_index_t vm_swap_out (void *page)
-{
-  // Ensure that the page is on user's virtual memory.
-  ASSERT (page >= PHYS_BASE);
-
-  // Find an available block region to use
-  size_t swap_index = bitmap_scan (swap_available, /*start*/0, /*cnt*/1, true);
-
-  size_t i;
-  for (i = 0; i < SECTORS_PER_PAGE; ++ i) {
-    block_write(swap_block,
-        /* sector number */  swap_index * SECTORS_PER_PAGE + i,
-        /* target address */ page + (BLOCK_SECTOR_SIZE * i)
-        );
-  }
-
-  // occupy the slot: available becomes false
-  bitmap_set(swap_available, swap_index, false);
-  return swap_index;
-}
-
-
-void vm_swap_in (swap_index_t swap_index, void *page)
-{
-  // Ensure that the page is on user's virtual memory.
-  ASSERT (page >= PHYS_BASE);
-
-  // check the swap region
-  ASSERT (swap_index < swap_size);
-  if (bitmap_test(swap_available, swap_index) == true) {
-    // still available slot, error
-    PANIC ("Error, invalid read access to unassigned swap block");
-  }
-
-  size_t i;
-  for (i = 0; i < SECTORS_PER_PAGE; ++ i) {
-    block_read (swap_block,
-        /* sector number */  swap_index * SECTORS_PER_PAGE + i,
-        /* target address */ page + (BLOCK_SECTOR_SIZE * i)
-        );
-  }
-
-  bitmap_set(swap_available, swap_index, true);
-}
-
+/* Swaps in page P, which must have a locked frame
+   (and be swapped out). */
 void
-vm_swap_free (swap_index_t swap_index)
+swap_in (struct page *p)
 {
-  // check the swap region
-  ASSERT (swap_index < swap_size);
-  if (bitmap_test(swap_available, swap_index) == true) {
-    PANIC ("Error, invalid free request to unassigned swap block");
+  size_t i;
+
+  ASSERT (p->frame != NULL);
+  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+  ASSERT (p->sector != (block_sector_t) -1);
+
+  for (i = 0; i < PAGE_SECTORS; i++)
+    block_read (swap_device, p->sector + i,
+                p->frame->base + i * BLOCK_SECTOR_SIZE);
+  bitmap_reset (swap_bitmap, p->sector / PAGE_SECTORS);
+  p->sector = (block_sector_t) -1;
+}
+
+/* Swaps out page P, which must have a locked frame. */
+bool
+swap_out (struct page *p)
+{
+  size_t slot;
+  size_t i;
+
+  ASSERT (p->frame != NULL);
+  ASSERT (lock_held_by_current_thread (&p->frame->lock));
+
+  lock_acquire (&swap_lock);
+  slot = bitmap_scan_and_flip (swap_bitmap, 0, 1, false);
+  lock_release (&swap_lock);
+  if (slot == BITMAP_ERROR)
+    return false;
+
+  p->sector = slot * PAGE_SECTORS;
+
+  /*  Write out page sectors for each modified block. */
+  for (i = 0; i < PAGE_SECTORS; i++)
+  {
+    block_write (swap_device, p->sector + i,
+                 (uint8_t *) p->frame->base + i * BLOCK_SECTOR_SIZE);
   }
-  bitmap_set(swap_available, swap_index, true);
+
+  p->private = false;
+  p->file = NULL;
+  p->file_offset = 0;
+  p->file_bytes = 0;
+
+  return true;
 }

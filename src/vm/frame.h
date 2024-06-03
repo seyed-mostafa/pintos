@@ -1,22 +1,23 @@
 #ifndef VM_FRAME_H
 #define VM_FRAME_H
 
-#include <hash.h>
-#include "lib/kernel/hash.h"
-
+#include <stdbool.h>
 #include "threads/synch.h"
-#include "threads/palloc.h"
 
+/* A physical frame. */
+struct frame 
+  {
+    struct lock lock;           /* Prevent simultaneous access. */
+    void *base;                 /* Kernel virtual base address. */
+    struct page *page;          /* Mapped process page, if any. */
+  };
 
-/* Functions for Frame manipulation. */
+void frame_init (void);
 
-void vm_frame_init (void);
-void* vm_frame_allocate (enum palloc_flags flags, void *upage);
+struct frame *frame_alloc_and_lock (struct page *);
+void frame_lock (struct page *);
 
-void vm_frame_free (void*);
-void vm_frame_remove_entry (void*);
-
-void vm_frame_pin (void* kpage);
-void vm_frame_unpin (void* kpage);
+void frame_free (struct frame *);
+void frame_unlock (struct frame *);
 
 #endif /* vm/frame.h */
